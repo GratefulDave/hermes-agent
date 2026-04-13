@@ -451,6 +451,13 @@ DEFAULT_CONFIG = {
         "tool_preview_length": 0,  # Max chars for tool call previews (0 = no limit, show full paths/commands)
     },
 
+    # Auto-generated session titles
+    "auto_title": {
+        "enabled": True,               # Set false to disable automatic title generation
+        "context_threshold": 0.15,      # Generate title when this fraction of context is used (default 15%)
+        "max_turns": 4,                 # Also generate title after this many user turns (whichever comes first)
+    },
+
     # Privacy settings
     "privacy": {
         "redact_pii": False,  # When True, hash user IDs and strip phone numbers from LLM context

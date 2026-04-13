@@ -7605,17 +7605,23 @@ class GatewayRunner:
             # Reset to 0 so the gateway writes ALL compressed messages.
             _effective_history_offset = 0 if _session_was_split else len(agent_history)
 
-            # Auto-generate session title after first exchange (non-blocking)
+            # Auto-generate session title based on context usage (non-blocking)
             if final_response and self._session_db:
                 try:
                     from agent.title_generator import maybe_auto_title
                     all_msgs = result_holder[0].get("messages", []) if result_holder[0] else []
+                    # Pass context info so the title generator can check usage %
+                    _agent_ctx_len = 0
+                    if agent and hasattr(agent, 'context_length'):
+                        _agent_ctx_len = agent.context_length or 0
                     maybe_auto_title(
                         self._session_db,
                         effective_session_id,
                         message,
                         final_response,
                         all_msgs,
+                        context_length=_agent_ctx_len,
+                        last_prompt_tokens=_last_prompt_toks or 0,
                     )
                 except Exception:
                     pass
