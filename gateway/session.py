@@ -32,9 +32,6 @@ def _now() -> datetime:
 # PII redaction helpers
 # ---------------------------------------------------------------------------
 
-_PHONE_RE = re.compile(r"^\+?\d[\d\-\s]{6,}$")
-
-
 def _hash_id(value: str) -> str:
     """Deterministic 12-char hex hash of an identifier."""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
@@ -57,10 +54,6 @@ def _hash_chat_id(value: str) -> str:
         return f"{prefix}:{_hash_id(value[colon + 1:])}"
     return _hash_id(value)
 
-
-def _looks_like_phone(value: str) -> bool:
-    """Return True if *value* looks like a phone number (E.164 or similar)."""
-    return bool(_PHONE_RE.match(value.strip()))
 
 from .config import (
     Platform,
@@ -144,15 +137,6 @@ class SessionSource:
             chat_id_alt=data.get("chat_id_alt"),
         )
     
-    @classmethod
-    def local_cli(cls) -> "SessionSource":
-        """Create a source representing the local CLI."""
-        return cls(
-            platform=Platform.LOCAL,
-            chat_id="cli",
-            chat_name="CLI terminal",
-            chat_type="dm",
-        )
 
 
 @dataclass
@@ -193,6 +177,7 @@ _PII_SAFE_PLATFORMS = frozenset({
     Platform.WHATSAPP,
     Platform.SIGNAL,
     Platform.TELEGRAM,
+    Platform.BLUEBUBBLES,
 })
 """Platforms where user IDs can be safely redacted (no in-message mention system
 that requires raw IDs).  Discord is excluded because mentions use ``<@user_id>``
@@ -254,8 +239,22 @@ def build_session_context_prompt(
     if context.source.chat_topic:
         lines.append(f"**Channel Topic:** {context.source.chat_topic}")
 
-    # User identity (especially useful for WhatsApp where multiple people DM)
-    if context.source.user_name:
+    # User identity.
+    # In shared thread sessions (non-DM with thread_id), multiple users
+    # contribute to the same conversation.  Don't pin a single user name
+    # in the system prompt — it changes per-turn and would bust the prompt
+    # cache.  Instead, note that this is a multi-user thread; individual
+    # sender names are prefixed on each user message by the gateway.
+    _is_shared_thread = (
+        context.source.chat_type != "dm"
+        and context.source.thread_id
+    )
+    if _is_shared_thread:
+        lines.append(
+            "**Session type:** Multi-user thread — messages are prefixed "
+            "with [sender name]. Multiple users may participate."
+        )
+    elif context.source.user_name:
         lines.append(f"**User:** {context.source.user_name}")
     elif context.source.user_id:
         uid = context.source.user_id
@@ -364,6 +363,17 @@ class SessionEntry:
     auto_reset_reason: Optional[str] = None  # "idle" or "daily"
     reset_had_activity: bool = False  # whether the expired session had any messages
     
+    # Set by the background expiry watcher after it successfully flushes
+    # memories for this session.  Persisted to sessions.json so the flag
+    # survives gateway restarts (the old in-memory _pre_flushed_sessions
+    # set was lost on restart, causing redundant re-flushes).
+    memory_flushed: bool = False
+
+    # When True the next call to get_or_create_session() will auto-reset
+    # this session (create a new session_id) so the user starts fresh.
+    # Set by /stop to break stuck-resume loops (#7536).
+    suspended: bool = False
+    
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "session_key": self.session_key,
@@ -381,6 +391,8 @@ class SessionEntry:
             "last_prompt_tokens": self.last_prompt_tokens,
             "estimated_cost_usd": self.estimated_cost_usd,
             "cost_status": self.cost_status,
+            "memory_flushed": self.memory_flushed,
+            "suspended": self.suspended,
         }
         if self.origin:
             result["origin"] = self.origin.to_dict()
@@ -416,10 +428,16 @@ class SessionEntry:
             last_prompt_tokens=data.get("last_prompt_tokens", 0),
             estimated_cost_usd=data.get("estimated_cost_usd", 0.0),
             cost_status=data.get("cost_status", "unknown"),
+            memory_flushed=data.get("memory_flushed", False),
+            suspended=data.get("suspended", False),
         )
 
 
-def build_session_key(source: SessionSource, group_sessions_per_user: bool = True) -> str:
+def build_session_key(
+    source: SessionSource,
+    group_sessions_per_user: bool = True,
+    thread_sessions_per_user: bool = False,
+) -> str:
     """Build a deterministic session key from a message source.
 
     This is the single source of truth for session key construction.
@@ -434,7 +452,11 @@ def build_session_key(source: SessionSource, group_sessions_per_user: bool = Tru
       - chat_id identifies the parent group/channel.
       - user_id/user_id_alt isolates participants within that parent chat when available when
         ``group_sessions_per_user`` is enabled.
-      - thread_id differentiates threads within that parent chat.
+      - thread_id differentiates threads within that parent chat.  When
+        ``thread_sessions_per_user`` is False (default), threads are *shared* across all
+        participants — user_id is NOT appended, so every user in the thread
+        shares a single session.  This is the expected UX for threaded
+        conversations (Telegram forum topics, Discord threads, Slack threads).
       - Without participant identifiers, or when isolation is disabled, messages fall back to one
         shared session per chat.
       - Without identifiers, messages fall back to one session per platform/chat_type.
@@ -456,7 +478,15 @@ def build_session_key(source: SessionSource, group_sessions_per_user: bool = Tru
         key_parts.append(source.chat_id)
     if source.thread_id:
         key_parts.append(source.thread_id)
-    if group_sessions_per_user and participant_id:
+
+    # In threads, default to shared sessions (all participants see the same
+    # conversation).  Per-user isolation only applies when explicitly enabled
+    # via thread_sessions_per_user, or when there is no thread (regular group).
+    isolate_user = group_sessions_per_user
+    if source.thread_id and not thread_sessions_per_user:
+        isolate_user = False
+
+    if isolate_user and participant_id:
         key_parts.append(str(participant_id))
 
     return ":".join(key_parts)
@@ -471,17 +501,13 @@ class SessionStore:
     """
     
     def __init__(self, sessions_dir: Path, config: GatewayConfig,
-                 has_active_processes_fn=None,
-                 on_auto_reset=None):
+                 has_active_processes_fn=None):
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
         self._loaded = False
         self._lock = threading.Lock()
         self._has_active_processes_fn = has_active_processes_fn
-        # on_auto_reset is deprecated — memory flush now runs proactively
-        # via the background session expiry watcher in GatewayRunner.
-        self._pre_flushed_sessions: set = set()  # session_ids already flushed by watcher
         
         # Initialize SQLite session database
         self._db = None
@@ -547,6 +573,7 @@ class SessionStore:
         return build_session_key(
             source,
             group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
+            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
         )
     
     def _is_session_expired(self, entry: SessionEntry) -> bool:
@@ -678,21 +705,23 @@ class SessionStore:
             if session_key in self._entries and not force_new:
                 entry = self._entries[session_key]
 
-                reset_reason = self._should_reset(entry, source)
+                # Auto-reset sessions marked as suspended (e.g. after /stop
+                # broke a stuck loop — #7536).
+                if entry.suspended:
+                    reset_reason = "suspended"
+                else:
+                    reset_reason = self._should_reset(entry, source)
                 if not reset_reason:
                     entry.updated_at = now
                     self._save()
                     return entry
                 else:
-                    # Session is being auto-reset.  The background expiry watcher
-                    # should have already flushed memories proactively; discard
-                    # the marker so it doesn't accumulate.
+                    # Session is being auto-reset.
                     was_auto_reset = True
                     auto_reset_reason = reset_reason
                     # Track whether the expired session had any real conversation
                     reset_had_activity = entry.total_tokens > 0
                     db_end_session_id = entry.session_id
-                    self._pre_flushed_sessions.discard(entry.session_id)
             else:
                 was_auto_reset = False
                 auto_reset_reason = None
@@ -741,66 +770,56 @@ class SessionStore:
     def update_session(
         self,
         session_key: str,
-        input_tokens: int = 0,
-        output_tokens: int = 0,
-        cache_read_tokens: int = 0,
-        cache_write_tokens: int = 0,
         last_prompt_tokens: int = None,
-        model: str = None,
-        estimated_cost_usd: Optional[float] = None,
-        cost_status: Optional[str] = None,
-        cost_source: Optional[str] = None,
-        provider: Optional[str] = None,
-        base_url: Optional[str] = None,
     ) -> None:
-        """Update a session's metadata after an interaction."""
-        db_session_id = None
-
+        """Update lightweight session metadata after an interaction."""
         with self._lock:
             self._ensure_loaded_locked()
 
             if session_key in self._entries:
                 entry = self._entries[session_key]
                 entry.updated_at = _now()
-                # Direct assignment — the gateway receives cumulative totals
-                # from the cached agent, not per-call deltas.
-                entry.input_tokens = input_tokens
-                entry.output_tokens = output_tokens
-                entry.cache_read_tokens = cache_read_tokens
-                entry.cache_write_tokens = cache_write_tokens
                 if last_prompt_tokens is not None:
                     entry.last_prompt_tokens = last_prompt_tokens
-                if estimated_cost_usd is not None:
-                    entry.estimated_cost_usd = estimated_cost_usd
-                if cost_status:
-                    entry.cost_status = cost_status
-                entry.total_tokens = (
-                    entry.input_tokens
-                    + entry.output_tokens
-                    + entry.cache_read_tokens
-                    + entry.cache_write_tokens
-                )
                 self._save()
-                db_session_id = entry.session_id
 
-        if self._db and db_session_id:
-            try:
-                self._db.set_token_counts(
-                    db_session_id,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    cache_read_tokens=cache_read_tokens,
-                    cache_write_tokens=cache_write_tokens,
-                    estimated_cost_usd=estimated_cost_usd,
-                    cost_status=cost_status,
-                    cost_source=cost_source,
-                    billing_provider=provider,
-                    billing_base_url=base_url,
-                    model=model,
-                    absolute=True,
-                )
-            except Exception as e:
-                logger.debug("Session DB operation failed: %s", e)
+    def suspend_session(self, session_key: str) -> bool:
+        """Mark a session as suspended so it auto-resets on next access.
+
+        Used by ``/stop`` to prevent stuck sessions from being resumed
+        after a gateway restart (#7536).  Returns True if the session
+        existed and was marked.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            if session_key in self._entries:
+                self._entries[session_key].suspended = True
+                self._save()
+                return True
+        return False
+
+    def suspend_recently_active(self, max_age_seconds: int = 120) -> int:
+        """Mark recently-active sessions as suspended.
+
+        Called on gateway startup to prevent sessions that were likely
+        in-flight when the gateway last exited from being blindly resumed
+        (#7536).  Only suspends sessions updated within *max_age_seconds*
+        to avoid resetting long-idle sessions that are harmless to resume.
+        Returns the number of sessions that were suspended.
+        """
+        from datetime import timedelta
+
+        cutoff = _now() - timedelta(seconds=max_age_seconds)
+        count = 0
+        with self._lock:
+            self._ensure_loaded_locked()
+            for entry in self._entries.values():
+                if not entry.suspended and entry.updated_at >= cutoff:
+                    entry.suspended = True
+                    count += 1
+            if count:
+                self._save()
+        return count
 
     def reset_session(self, session_key: str) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""

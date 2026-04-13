@@ -20,6 +20,11 @@ from hermes_cli.config import (
     load_config, save_config, get_env_value, save_env_value,
 )
 from hermes_cli.colors import Colors, color
+from hermes_cli.nous_subscription import (
+    apply_nous_managed_defaults,
+    get_nous_subscription_features,
+)
+from tools.tool_backend_helpers import managed_nous_tools_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -28,49 +33,13 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 # ─── UI Helpers (shared with setup.py) ────────────────────────────────────────
 
-def _print_info(text: str):
-    print(color(f"  {text}", Colors.DIM))
-
-def _print_success(text: str):
-    print(color(f"✓ {text}", Colors.GREEN))
-
-def _print_warning(text: str):
-    print(color(f"⚠ {text}", Colors.YELLOW))
-
-def _print_error(text: str):
-    print(color(f"✗ {text}", Colors.RED))
-
-def _prompt(question: str, default: str = None, password: bool = False) -> str:
-    if default:
-        display = f"{question} [{default}]: "
-    else:
-        display = f"{question}: "
-    try:
-        if password:
-            import getpass
-            value = getpass.getpass(color(display, Colors.YELLOW))
-        else:
-            value = input(color(display, Colors.YELLOW))
-        return value.strip() or default or ""
-    except (KeyboardInterrupt, EOFError):
-        print()
-        return default or ""
-
-def _prompt_yes_no(question: str, default: bool = True) -> bool:
-    default_str = "Y/n" if default else "y/N"
-    while True:
-        try:
-            value = input(color(f"{question} [{default_str}]: ", Colors.YELLOW)).strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            print()
-            return default
-        if not value:
-            return default
-        if value in ('y', 'yes'):
-            return True
-        if value in ('n', 'no'):
-            return False
-
+from hermes_cli.cli_output import (  # noqa: E402 — late import block
+    print_error as _print_error,
+    print_info as _print_info,
+    print_success as _print_success,
+    print_warning as _print_warning,
+    prompt as _prompt,
+)
 
 # ─── Toolset Registry ─────────────────────────────────────────────────────────
 
@@ -129,22 +98,14 @@ def _get_plugin_toolset_keys() -> set:
     except Exception:
         return set()
 
-# Platform display config
+# Platform display config — derived from the canonical registry so every
+# module shares the same data.  Kept as dict-of-dicts for backward
+# compatibility with existing ``PLATFORMS[key]["label"]`` access patterns.
+from hermes_cli.platforms import PLATFORMS as _PLATFORMS_REGISTRY
+
 PLATFORMS = {
-    "cli":      {"label": "🖥️  CLI",       "default_toolset": "hermes-cli"},
-    "telegram": {"label": "📱 Telegram",   "default_toolset": "hermes-telegram"},
-    "discord":  {"label": "💬 Discord",    "default_toolset": "hermes-discord"},
-    "slack":    {"label": "💼 Slack",      "default_toolset": "hermes-slack"},
-    "whatsapp": {"label": "📱 WhatsApp",   "default_toolset": "hermes-whatsapp"},
-    "signal":   {"label": "📡 Signal",     "default_toolset": "hermes-signal"},
-    "homeassistant": {"label": "🏠 Home Assistant", "default_toolset": "hermes-homeassistant"},
-    "email":    {"label": "📧 Email",      "default_toolset": "hermes-email"},
-    "matrix":   {"label": "💬 Matrix",     "default_toolset": "hermes-matrix"},
- "dingtalk": {"label": "💬 DingTalk", "default_toolset": "hermes-dingtalk"},
-    "feishu": {"label": "🪽 Feishu", "default_toolset": "hermes-feishu"},
-    "wecom": {"label": "💬 WeCom", "default_toolset": "hermes-wecom"},
-    "api_server": {"label": "🌐 API Server", "default_toolset": "hermes-api-server"},
-    "mattermost": {"label": "💬 Mattermost", "default_toolset": "hermes-mattermost"},
+    k: {"label": info.label, "default_toolset": info.default_toolset}
+    for k, info in _PLATFORMS_REGISTRY.items()
 }
 
 
@@ -158,6 +119,15 @@ TOOL_CATEGORIES = {
         "name": "Text-to-Speech",
         "icon": "🔊",
         "providers": [
+            {
+                "name": "Nous Subscription",
+                "tag": "Managed OpenAI TTS billed to your subscription",
+                "env_vars": [],
+                "tts_provider": "openai",
+                "requires_nous_auth": True,
+                "managed_nous_feature": "tts",
+                "override_env_vars": ["VOICE_TOOLS_OPENAI_KEY", "OPENAI_API_KEY"],
+            },
             {
                 "name": "Microsoft Edge TTS",
                 "tag": "Free - no API key needed",
@@ -180,6 +150,14 @@ TOOL_CATEGORIES = {
                 ],
                 "tts_provider": "elevenlabs",
             },
+            {
+                "name": "Mistral (Voxtral TTS)",
+                "tag": "Multilingual, native Opus, needs MISTRAL_API_KEY",
+                "env_vars": [
+                    {"key": "MISTRAL_API_KEY", "prompt": "Mistral API key", "url": "https://console.mistral.ai/"},
+                ],
+                "tts_provider": "mistral",
+            },
         ],
     },
     "web": {
@@ -188,6 +166,15 @@ TOOL_CATEGORIES = {
         "setup_note": "A free DuckDuckGo search skill is also included — skip this if you don't need a premium provider.",
         "icon": "🔍",
         "providers": [
+            {
+                "name": "Nous Subscription",
+                "tag": "Managed Firecrawl billed to your subscription",
+                "web_backend": "firecrawl",
+                "env_vars": [],
+                "requires_nous_auth": True,
+                "managed_nous_feature": "web",
+                "override_env_vars": ["FIRECRAWL_API_KEY", "FIRECRAWL_API_URL"],
+            },
             {
                 "name": "Firecrawl Cloud",
                 "tag": "Hosted service - search, extract, and crawl",
@@ -235,6 +222,14 @@ TOOL_CATEGORIES = {
         "icon": "🎨",
         "providers": [
             {
+                "name": "Nous Subscription",
+                "tag": "Managed FAL image generation billed to your subscription",
+                "env_vars": [],
+                "requires_nous_auth": True,
+                "managed_nous_feature": "image_gen",
+                "override_env_vars": ["FAL_KEY"],
+            },
+            {
                 "name": "FAL.ai",
                 "tag": "FLUX 2 Pro with auto-upscaling",
                 "env_vars": [
@@ -248,11 +243,21 @@ TOOL_CATEGORIES = {
         "icon": "🌐",
         "providers": [
             {
+                "name": "Nous Subscription (Browser Use cloud)",
+                "tag": "Managed Browser Use billed to your subscription",
+                "env_vars": [],
+                "browser_provider": "browser-use",
+                "requires_nous_auth": True,
+                "managed_nous_feature": "browser",
+                "override_env_vars": ["BROWSER_USE_API_KEY"],
+                "post_setup": "agent_browser",
+            },
+            {
                 "name": "Local Browser",
                 "tag": "Free headless Chromium (no API key needed)",
                 "env_vars": [],
-                "browser_provider": None,
-                "post_setup": "browserbase",  # Same npm install for agent-browser
+                "browser_provider": "local",
+                "post_setup": "agent_browser",
             },
             {
                 "name": "Browserbase",
@@ -262,7 +267,7 @@ TOOL_CATEGORIES = {
                     {"key": "BROWSERBASE_PROJECT_ID", "prompt": "Browserbase project ID"},
                 ],
                 "browser_provider": "browserbase",
-                "post_setup": "browserbase",
+                "post_setup": "agent_browser",
             },
             {
                 "name": "Browser Use",
@@ -271,7 +276,16 @@ TOOL_CATEGORIES = {
                     {"key": "BROWSER_USE_API_KEY", "prompt": "Browser Use API key", "url": "https://browser-use.com"},
                 ],
                 "browser_provider": "browser-use",
-                "post_setup": "browserbase",
+                "post_setup": "agent_browser",
+            },
+            {
+                "name": "Firecrawl",
+                "tag": "Cloud browser with remote execution",
+                "env_vars": [
+                    {"key": "FIRECRAWL_API_KEY", "prompt": "Firecrawl API key", "url": "https://firecrawl.dev"},
+                ],
+                "browser_provider": "firecrawl",
+                "post_setup": "agent_browser",
             },
             {
                 "name": "Camofox",
@@ -330,7 +344,7 @@ TOOLSET_ENV_REQUIREMENTS = {
 def _run_post_setup(post_setup_key: str):
     """Run post-setup hooks for tools that need extra installation steps."""
     import shutil
-    if post_setup_key == "browserbase":
+    if post_setup_key in ("agent_browser", "browserbase"):
         node_modules = PROJECT_ROOT / "node_modules" / "agent-browser"
         if not node_modules.exists() and shutil.which("npm"):
             _print_info("    Installing Node.js dependencies for browser tools...")
@@ -364,10 +378,10 @@ def _run_post_setup(post_setup_key: str):
             _print_info("    Start the Camofox server:")
             _print_info("      npx @askjo/camoufox-browser")
             _print_info("    First run downloads the Camoufox engine (~300MB)")
-            _print_info("    Or use Docker: docker run -p 9377:9377 jo-inc/camofox-browser")
+            _print_info("    Or use Docker: docker run -p 9377:9377 -e CAMOFOX_PORT=9377 jo-inc/camofox-browser")
         elif not shutil.which("npm"):
             _print_warning("    Node.js not found. Install Camofox via Docker:")
-            _print_info("      docker run -p 9377:9377 jo-inc/camofox-browser")
+            _print_info("      docker run -p 9377:9377 -e CAMOFOX_PORT=9377 jo-inc/camofox-browser")
 
     elif post_setup_key == "rl_training":
         try:
@@ -464,6 +478,10 @@ def _get_platform_tools(
         default_ts = PLATFORMS[platform]["default_toolset"]
         toolset_names = [default_ts]
 
+    # YAML may parse bare numeric names (e.g. ``12306:``) as int.
+    # Normalise to str so downstream sorted() never mixes types.
+    toolset_names = [str(ts) for ts in toolset_names]
+
     configurable_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
 
     # If the saved list contains any configurable keys directly, the user
@@ -519,17 +537,23 @@ def _get_platform_tools(
     # MCP servers are expected to be available on all platforms by default.
     # If the platform explicitly lists one or more MCP server names, treat that
     # as an allowlist. Otherwise include every globally enabled MCP server.
-    mcp_servers = config.get("mcp_servers", {})
+    # Special sentinel: "no_mcp" in the toolset list disables all MCP servers.
+    mcp_servers = config.get("mcp_servers") or {}
     enabled_mcp_servers = {
-        name
+        str(name)
         for name, server_cfg in mcp_servers.items()
         if isinstance(server_cfg, dict)
         and _parse_enabled_flag(server_cfg.get("enabled", True), default=True)
     }
-    explicit_mcp_servers = explicit_passthrough & enabled_mcp_servers
-    enabled_toolsets.update(explicit_passthrough - enabled_mcp_servers)
+    # Allow "no_mcp" sentinel to opt out of all MCP servers for this platform
+    if "no_mcp" in toolset_names:
+        explicit_mcp_servers = set()
+        enabled_toolsets.update(explicit_passthrough - enabled_mcp_servers - {"no_mcp"})
+    else:
+        explicit_mcp_servers = explicit_passthrough & enabled_mcp_servers
+        enabled_toolsets.update(explicit_passthrough - enabled_mcp_servers)
     if include_default_mcp_servers:
-        if explicit_mcp_servers:
+        if explicit_mcp_servers or "no_mcp" in toolset_names:
             enabled_toolsets.update(explicit_mcp_servers)
         else:
             enabled_toolsets.update(enabled_mcp_servers)
@@ -581,8 +605,11 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
     save_config(config)
 
 
-def _toolset_has_keys(ts_key: str) -> bool:
+def _toolset_has_keys(ts_key: str, config: dict = None) -> bool:
     """Check if a toolset's required API keys are configured."""
+    if config is None:
+        config = load_config()
+
     if ts_key == "vision":
         try:
             from agent.auxiliary_client import resolve_vision_provider_client
@@ -592,10 +619,16 @@ def _toolset_has_keys(ts_key: str) -> bool:
         except Exception:
             return False
 
+    if ts_key in {"web", "image_gen", "tts", "browser"}:
+        features = get_nous_subscription_features(config)
+        feature = features.features.get(ts_key)
+        if feature and (feature.available or feature.managed_by_nous):
+            return True
+
     # Check TOOL_CATEGORIES first (provider-aware)
     cat = TOOL_CATEGORIES.get(ts_key)
     if cat:
-        for provider in cat.get("providers", []):
+        for provider in _visible_providers(cat, config):
             env_vars = provider.get("env_vars", [])
             if not env_vars:
                 return True  # No-key provider (e.g. Local Browser, Edge TTS)
@@ -613,84 +646,9 @@ def _toolset_has_keys(ts_key: str) -> bool:
 # ─── Menu Helpers ─────────────────────────────────────────────────────────────
 
 def _prompt_choice(question: str, choices: list, default: int = 0) -> int:
-    """Single-select menu (arrow keys). Uses curses to avoid simple_term_menu
-    rendering bugs in tmux, iTerm, and other non-standard terminals."""
-
-    # Curses-based single-select — works in tmux, iTerm, and standard terminals
-    try:
-        import curses
-        result_holder = [default]
-
-        def _curses_menu(stdscr):
-            curses.curs_set(0)
-            if curses.has_colors():
-                curses.start_color()
-                curses.use_default_colors()
-                curses.init_pair(1, curses.COLOR_GREEN, -1)
-                curses.init_pair(2, curses.COLOR_YELLOW, -1)
-            cursor = default
-
-            while True:
-                stdscr.clear()
-                max_y, max_x = stdscr.getmaxyx()
-                try:
-                    stdscr.addnstr(0, 0, question, max_x - 1,
-                                   curses.A_BOLD | (curses.color_pair(2) if curses.has_colors() else 0))
-                except curses.error:
-                    pass
-
-                for i, c in enumerate(choices):
-                    y = i + 2
-                    if y >= max_y - 1:
-                        break
-                    arrow = "→" if i == cursor else " "
-                    line = f" {arrow}  {c}"
-                    attr = curses.A_NORMAL
-                    if i == cursor:
-                        attr = curses.A_BOLD
-                        if curses.has_colors():
-                            attr |= curses.color_pair(1)
-                    try:
-                        stdscr.addnstr(y, 0, line, max_x - 1, attr)
-                    except curses.error:
-                        pass
-
-                stdscr.refresh()
-                key = stdscr.getch()
-
-                if key in (curses.KEY_UP, ord('k')):
-                    cursor = (cursor - 1) % len(choices)
-                elif key in (curses.KEY_DOWN, ord('j')):
-                    cursor = (cursor + 1) % len(choices)
-                elif key in (curses.KEY_ENTER, 10, 13):
-                    result_holder[0] = cursor
-                    return
-                elif key in (27, ord('q')):
-                    return
-
-        curses.wrapper(_curses_menu)
-        return result_holder[0]
-
-    except Exception:
-        pass
-
-    # Fallback: numbered input (Windows without curses, etc.)
-    print(color(question, Colors.YELLOW))
-    for i, c in enumerate(choices):
-        marker = "●" if i == default else "○"
-        style = Colors.GREEN if i == default else ""
-        print(color(f"  {marker} {i+1}. {c}", style) if style else f"  {marker} {i+1}. {c}")
-    while True:
-        try:
-            val = input(color(f"  Select [1-{len(choices)}] ({default + 1}): ", Colors.DIM))
-            if not val:
-                return default
-            idx = int(val) - 1
-            if 0 <= idx < len(choices):
-                return idx
-        except (ValueError, KeyboardInterrupt, EOFError):
-            print()
-            return default
+    """Single-select menu (arrow keys). Delegates to curses_radiolist."""
+    from hermes_cli.curses_ui import curses_radiolist
+    return curses_radiolist(question, choices, selected=default, cancel_returns=default)
 
 
 # ─── Token Estimation ────────────────────────────────────────────────────────
@@ -805,11 +763,45 @@ def _configure_toolset(ts_key: str, config: dict):
         _configure_simple_requirements(ts_key)
 
 
+def _visible_providers(cat: dict, config: dict) -> list[dict]:
+    """Return provider entries visible for the current auth/config state."""
+    features = get_nous_subscription_features(config)
+    visible = []
+    for provider in cat.get("providers", []):
+        if provider.get("managed_nous_feature") and not managed_nous_tools_enabled():
+            continue
+        if provider.get("requires_nous_auth") and not features.nous_auth_present:
+            continue
+        visible.append(provider)
+    return visible
+
+
+def _toolset_needs_configuration_prompt(ts_key: str, config: dict) -> bool:
+    """Return True when enabling this toolset should open provider setup."""
+    cat = TOOL_CATEGORIES.get(ts_key)
+    if not cat:
+        return not _toolset_has_keys(ts_key, config)
+
+    if ts_key == "tts":
+        tts_cfg = config.get("tts", {})
+        return not isinstance(tts_cfg, dict) or "provider" not in tts_cfg
+    if ts_key == "web":
+        web_cfg = config.get("web", {})
+        return not isinstance(web_cfg, dict) or "backend" not in web_cfg
+    if ts_key == "browser":
+        browser_cfg = config.get("browser", {})
+        return not isinstance(browser_cfg, dict) or "cloud_provider" not in browser_cfg
+    if ts_key == "image_gen":
+        return not get_env_value("FAL_KEY")
+
+    return not _toolset_has_keys(ts_key, config)
+
+
 def _configure_tool_category(ts_key: str, cat: dict, config: dict):
     """Configure a tool category with provider selection."""
     icon = cat.get("icon", "")
     name = cat["name"]
-    providers = cat["providers"]
+    providers = _visible_providers(cat, config)
 
     # Check Python version requirement
     if cat.get("requires_python"):
@@ -874,6 +866,27 @@ def _configure_tool_category(ts_key: str, cat: dict, config: dict):
 
 def _is_provider_active(provider: dict, config: dict) -> bool:
     """Check if a provider entry matches the currently active config."""
+    managed_feature = provider.get("managed_nous_feature")
+    if managed_feature:
+        features = get_nous_subscription_features(config)
+        feature = features.features.get(managed_feature)
+        if feature is None:
+            return False
+        if managed_feature == "image_gen":
+            return feature.managed_by_nous
+        if provider.get("tts_provider"):
+            return (
+                feature.managed_by_nous
+                and config.get("tts", {}).get("provider") == provider["tts_provider"]
+            )
+        if "browser_provider" in provider:
+            current = config.get("browser", {}).get("cloud_provider")
+            return feature.managed_by_nous and provider["browser_provider"] == current
+        if provider.get("web_backend"):
+            current = config.get("web", {}).get("backend")
+            return feature.managed_by_nous and current == provider["web_backend"]
+        return feature.managed_by_nous
+
     if provider.get("tts_provider"):
         return config.get("tts", {}).get("provider") == provider["tts_provider"]
     if "browser_provider" in provider:
@@ -900,6 +913,13 @@ def _detect_active_provider_index(providers: list, config: dict) -> int:
 def _configure_provider(provider: dict, config: dict):
     """Configure a single provider - prompt for API keys and set config."""
     env_vars = provider.get("env_vars", [])
+    managed_feature = provider.get("managed_nous_feature")
+
+    if provider.get("requires_nous_auth"):
+        features = get_nous_subscription_features(config)
+        if not features.nous_auth_present:
+            _print_warning("  Nous Subscription is only available after logging into Nous Portal.")
+            return
 
     # Set TTS provider in config if applicable
     if provider.get("tts_provider"):
@@ -908,11 +928,12 @@ def _configure_provider(provider: dict, config: dict):
     # Set browser cloud provider in config if applicable
     if "browser_provider" in provider:
         bp = provider["browser_provider"]
-        if bp:
+        if bp == "local":
+            config.setdefault("browser", {})["cloud_provider"] = "local"
+            _print_success("  Browser set to local mode")
+        elif bp:
             config.setdefault("browser", {})["cloud_provider"] = bp
             _print_success(f"  Browser cloud provider set to: {bp}")
-        else:
-            config.get("browser", {}).pop("cloud_provider", None)
 
     # Set web search backend in config if applicable
     if provider.get("web_backend"):
@@ -920,7 +941,16 @@ def _configure_provider(provider: dict, config: dict):
         _print_success(f"  Web backend set to: {provider['web_backend']}")
 
     if not env_vars:
+        if provider.get("post_setup"):
+            _run_post_setup(provider["post_setup"])
         _print_success(f"  {provider['name']} - no configuration needed!")
+        if managed_feature:
+            _print_info("  Requests for this tool will be billed to your Nous subscription.")
+            override_envs = provider.get("override_env_vars", [])
+            if any(get_env_value(env_var) for env_var in override_envs):
+                _print_warning(
+                    "  Direct credentials are still configured and may take precedence until you remove them from ~/.hermes/.env."
+                )
         return
 
     # Prompt for each required env var
@@ -983,8 +1013,13 @@ def _configure_simple_requirements(ts_key: str):
             key_label = "    OPENAI_API_KEY" if "api.openai.com" in base_url.lower() else "    API key"
             api_key = _prompt(key_label, password=True)
             if api_key and api_key.strip():
-                save_env_value("OPENAI_BASE_URL", base_url)
                 save_env_value("OPENAI_API_KEY", api_key.strip())
+                # Save vision base URL to config (not .env — only secrets go there)
+                from hermes_cli.config import load_config, save_config
+                _cfg = load_config()
+                _aux = _cfg.setdefault("auxiliary", {}).setdefault("vision", {})
+                _aux["base_url"] = base_url
+                save_config(_cfg)
                 if "api.openai.com" in base_url.lower():
                     save_env_value("AUXILIARY_VISION_MODEL", "gpt-4o-mini")
                 _print_success("    Saved")
@@ -1023,7 +1058,7 @@ def _reconfigure_tool(config: dict):
         cat = TOOL_CATEGORIES.get(ts_key)
         reqs = TOOLSET_ENV_REQUIREMENTS.get(ts_key)
         if cat or reqs:
-            if _toolset_has_keys(ts_key):
+            if _toolset_has_keys(ts_key, config):
                 configurable.append((ts_key, ts_label))
 
     if not configurable:
@@ -1053,7 +1088,7 @@ def _configure_tool_category_for_reconfig(ts_key: str, cat: dict, config: dict):
     """Reconfigure a tool category - provider selection + API key update."""
     icon = cat.get("icon", "")
     name = cat["name"]
-    providers = cat["providers"]
+    providers = _visible_providers(cat, config)
 
     if len(providers) == 1:
         provider = providers[0]
@@ -1088,6 +1123,13 @@ def _configure_tool_category_for_reconfig(ts_key: str, cat: dict, config: dict):
 def _reconfigure_provider(provider: dict, config: dict):
     """Reconfigure a provider - update API keys."""
     env_vars = provider.get("env_vars", [])
+    managed_feature = provider.get("managed_nous_feature")
+
+    if provider.get("requires_nous_auth"):
+        features = get_nous_subscription_features(config)
+        if not features.nous_auth_present:
+            _print_warning("  Nous Subscription is only available after logging into Nous Portal.")
+            return
 
     if provider.get("tts_provider"):
         config.setdefault("tts", {})["provider"] = provider["tts_provider"]
@@ -1095,12 +1137,12 @@ def _reconfigure_provider(provider: dict, config: dict):
 
     if "browser_provider" in provider:
         bp = provider["browser_provider"]
-        if bp:
+        if bp == "local":
+            config.setdefault("browser", {})["cloud_provider"] = "local"
+            _print_success("  Browser set to local mode")
+        elif bp:
             config.setdefault("browser", {})["cloud_provider"] = bp
             _print_success(f"  Browser cloud provider set to: {bp}")
-        else:
-            config.get("browser", {}).pop("cloud_provider", None)
-            _print_success("  Browser set to local mode")
 
     # Set web search backend in config if applicable
     if provider.get("web_backend"):
@@ -1108,7 +1150,16 @@ def _reconfigure_provider(provider: dict, config: dict):
         _print_success(f"  Web backend set to: {provider['web_backend']}")
 
     if not env_vars:
+        if provider.get("post_setup"):
+            _run_post_setup(provider["post_setup"])
         _print_success(f"  {provider['name']} - no configuration needed!")
+        if managed_feature:
+            _print_info("  Requests for this tool will be billed to your Nous subscription.")
+            override_envs = provider.get("override_env_vars", [])
+            if any(get_env_value(env_var) for env_var in override_envs):
+                _print_warning(
+                    "  Direct credentials are still configured and may take precedence until you remove them from ~/.hermes/.env."
+                )
         return
 
     for var in env_vars:
@@ -1192,6 +1243,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
     print(color("⚕ Hermes Tool Configuration", Colors.CYAN, Colors.BOLD))
     print(color("  Enable or disable tools per platform.", Colors.DIM))
     print(color("  Tools that need API keys will be configured when enabled.", Colors.DIM))
+    print(color("  Guide: https://hermes-agent.nousresearch.com/docs/user-guide/features/tools", Colors.DIM))
     print()
 
     # ── First-time install: linear flow, no platform menu ──
@@ -1217,13 +1269,23 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
                     label = next((l for k, l, _ in _get_effective_configurable_toolsets() if k == ts), ts)
                     print(color(f"  - {label}", Colors.RED))
 
+            auto_configured = apply_nous_managed_defaults(
+                config,
+                enabled_toolsets=new_enabled,
+            )
+            if managed_nous_tools_enabled():
+                for ts_key in sorted(auto_configured):
+                    label = next((l for k, l, _ in CONFIGURABLE_TOOLSETS if k == ts_key), ts_key)
+                    print(color(f"  ✓ {label}: using your Nous subscription defaults", Colors.GREEN))
+
             # Walk through ALL selected tools that have provider options or
             # need API keys.  This ensures browser (Local vs Browserbase),
             # TTS (Edge vs OpenAI vs ElevenLabs), etc. are shown even when
             # a free provider exists.
             to_configure = [
                 ts_key for ts_key in sorted(new_enabled)
-                if TOOL_CATEGORIES.get(ts_key) or TOOLSET_ENV_REQUIREMENTS.get(ts_key)
+                if (TOOL_CATEGORIES.get(ts_key) or TOOLSET_ENV_REQUIREMENTS.get(ts_key))
+                and ts_key not in auto_configured
             ]
 
             if to_configure:
@@ -1316,7 +1378,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
                     # Configure API keys for newly enabled tools
                     for ts_key in sorted(added):
                         if (TOOL_CATEGORIES.get(ts_key) or TOOLSET_ENV_REQUIREMENTS.get(ts_key)):
-                            if not _toolset_has_keys(ts_key):
+                            if _toolset_needs_configuration_prompt(ts_key, config):
                                 _configure_toolset(ts_key, config)
                     _save_platform_tools(config, pk, new_enabled)
                 save_config(config)
@@ -1356,7 +1418,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
             # Configure newly enabled toolsets that need API keys
             for ts_key in sorted(added):
                 if (TOOL_CATEGORIES.get(ts_key) or TOOLSET_ENV_REQUIREMENTS.get(ts_key)):
-                    if not _toolset_has_keys(ts_key):
+                    if _toolset_needs_configuration_prompt(ts_key, config):
                         _configure_toolset(ts_key, config)
 
             _save_platform_tools(config, pkey, new_enabled)

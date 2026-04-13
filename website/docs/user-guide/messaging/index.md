@@ -6,9 +6,32 @@ description: "Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, 
 
 # Messaging Gateway
 
-Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, SMS, Email, Home Assistant, Mattermost, Matrix, DingTalk, Feishu/Lark, WeCom, or your browser. The gateway is a single background process that connects to all your configured platforms, handles sessions, runs cron jobs, and delivers voice messages.
+Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, SMS, Email, Home Assistant, Mattermost, Matrix, DingTalk, Feishu/Lark, WeCom, Weixin, BlueBubbles (iMessage), or your browser. The gateway is a single background process that connects to all your configured platforms, handles sessions, runs cron jobs, and delivers voice messages.
 
 For the full voice feature set — including CLI microphone mode, spoken replies in messaging, and Discord voice-channel conversations — see [Voice Mode](/docs/user-guide/features/voice-mode) and [Use Voice Mode with Hermes](/docs/guides/use-voice-mode-with-hermes).
+
+## Platform Comparison
+
+| Platform | Voice | Images | Files | Threads | Reactions | Typing | Streaming |
+|----------|:-----:|:------:|:-----:|:-------:|:---------:|:------:|:---------:|
+| Telegram | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ |
+| Discord | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Slack | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| WhatsApp | — | ✅ | ✅ | — | — | ✅ | ✅ |
+| Signal | — | ✅ | ✅ | — | — | ✅ | ✅ |
+| SMS | — | — | — | — | — | — | — |
+| Email | — | ✅ | ✅ | ✅ | — | — | — |
+| Home Assistant | — | — | — | — | — | — | — |
+| Mattermost | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ |
+| Matrix | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| DingTalk | — | — | — | — | — | ✅ | ✅ |
+| Feishu/Lark | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| WeCom | ✅ | ✅ | ✅ | — | — | ✅ | ✅ |
+| WeCom Callback | — | — | — | — | — | — | — |
+| Weixin | ✅ | ✅ | ✅ | — | — | ✅ | ✅ |
+| BlueBubbles | — | ✅ | ✅ | — | ✅ | ✅ | — |
+
+**Voice** = TTS audio replies and/or voice message transcription. **Images** = send/receive images. **Files** = send/receive file attachments. **Threads** = threaded conversations. **Reactions** = emoji reactions on messages. **Typing** = typing indicator while processing. **Streaming** = progressive message updates via editing.
 
 ## Architecture
 
@@ -29,6 +52,9 @@ flowchart TB
             dt[DingTalk]
     fs[Feishu/Lark]
     wc[WeCom]
+    wcb[WeCom Callback]
+    wx[Weixin]
+    bb[BlueBubbles]
             api["API Server<br/>(OpenAI-compatible)"]
             wh[Webhooks]
         end
@@ -49,6 +75,11 @@ flowchart TB
     mm --> store
     mx --> store
     dt --> store
+    fs --> store
+    wc --> store
+    wcb --> store
+    wx --> store
+    bb --> store
     api --> store
     wh --> store
     store --> agent
@@ -150,6 +181,9 @@ EMAIL_ALLOWED_USERS=trusted@example.com,colleague@work.com
 MATTERMOST_ALLOWED_USERS=3uo8dkh1p7g1mfk49ear5fzs5c
 MATRIX_ALLOWED_USERS=@alice:matrix.org
 DINGTALK_ALLOWED_USERS=user-id-1
+FEISHU_ALLOWED_USERS=ou_xxxxxxxx,ou_yyyyyyyy
+WECOM_ALLOWED_USERS=user-id-1,user-id-2
+WECOM_CALLBACK_ALLOWED_USERS=user-id-1,user-id-2
 
 # Or allow
 GATEWAY_ALLOWED_USERS=123456789,987654321
@@ -332,6 +366,9 @@ Each platform has its own toolset:
 | DingTalk | `hermes-dingtalk` | Full tools including terminal |
 | Feishu/Lark | `hermes-feishu` | Full tools including terminal |
 | WeCom | `hermes-wecom` | Full tools including terminal |
+| WeCom Callback | `hermes-wecom-callback` | Full tools including terminal |
+| Weixin | `hermes-weixin` | Full tools including terminal |
+| BlueBubbles | `hermes-bluebubbles` | Full tools including terminal |
 | API Server | `hermes` (default) | Full tools including terminal |
 | Webhooks | `hermes-webhook` | Full tools including terminal |
 
@@ -350,5 +387,8 @@ Each platform has its own toolset:
 - [DingTalk Setup](dingtalk.md)
 - [Feishu/Lark Setup](feishu.md)
 - [WeCom Setup](wecom.md)
+- [WeCom Callback Setup](wecom-callback.md)
+- [Weixin Setup (WeChat)](weixin.md)
+- [BlueBubbles Setup (iMessage)](bluebubbles.md)
 - [Open WebUI + API Server](open-webui.md)
 - [Webhooks](webhooks.md)
