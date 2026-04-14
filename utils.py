@@ -1,12 +1,34 @@
 """Shared utility functions for hermes-agent."""
 
 import json
+import logging
 import os
 import tempfile
 from pathlib import Path
 from typing import Any, Union
 
 import yaml
+
+logger = logging.getLogger(__name__)
+
+
+TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
+
+
+def is_truthy_value(value: Any, default: bool = False) -> bool:
+    """Coerce bool-ish values using the project's shared truthy string set."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in TRUTHY_STRINGS
+    return bool(value)
+
+
+def env_var_enabled(name: str, default: str = "") -> bool:
+    """Return True when an environment variable is set to a truthy value."""
+    return is_truthy_value(os.getenv(name, default), default=False)
 
 
 def atomic_json_write(
@@ -105,3 +127,38 @@ def atomic_yaml_write(
         except OSError:
             pass
         raise
+
+
+# ─── JSON Helpers ─────────────────────────────────────────────────────────────
+
+
+def safe_json_loads(text: str, default: Any = None) -> Any:
+    """Parse JSON, returning *default* on any parse error.
+
+    Replaces the ``try: json.loads(x) except (JSONDecodeError, TypeError)``
+    pattern duplicated across display.py, anthropic_adapter.py,
+    auxiliary_client.py, and others.
+    """
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return default
+
+
+# ─── Environment Variable Helpers ─────────────────────────────────────────────
+
+
+def env_int(key: str, default: int = 0) -> int:
+    """Read an environment variable as an integer, with fallback."""
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        return default
+
+
+def env_bool(key: str, default: bool = False) -> bool:
+    """Read an environment variable as a boolean."""
+    return is_truthy_value(os.getenv(key, ""), default=default)

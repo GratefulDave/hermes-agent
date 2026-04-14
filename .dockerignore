@@ -5,9 +5,12 @@
 
 # Dependencies
 node_modules
+.venv
 
 # CI/CD
 .github
 
 # Environment files
 .env
+
+*.md
