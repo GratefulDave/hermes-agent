@@ -5,6 +5,8 @@ import pwd
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import hermes_cli.gateway as gateway_cli
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
@@ -111,6 +113,40 @@ class TestGeneratedSystemdUnits:
         assert "WantedBy=multi-user.target" in unit
 
 
+class TestLaunchdDomainDetection:
+    def test_launchd_domain_prefers_gui_when_available(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli.os, "getuid", lambda: 501)
+
+        calls = []
+
+        def fake_run(cmd, check=False, capture_output=False, text=False, timeout=None, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="gui ok", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._launchd_domain() == "gui/501"
+        assert calls == [["launchctl", "print", "gui/501"]]
+
+    def test_launchd_domain_falls_back_to_user_when_gui_unavailable(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli.os, "getuid", lambda: 501)
+
+        calls = []
+
+        def fake_run(cmd, check=False, capture_output=False, text=False, timeout=None, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(
+                returncode=125,
+                stdout="",
+                stderr="Domain does not support specified action",
+            )
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._launchd_domain() == "user/501"
+        assert calls == [["launchctl", "print", "gui/501"]]
+
+
 class TestGatewayStopCleanup:
     def test_stop_only_kills_current_profile_by_default(self, tmp_path, monkeypatch):
         """Without --all, stop uses systemd (if available) and does NOT call
@@ -166,6 +202,11 @@ class TestGatewayStopCleanup:
 
 
 class TestLaunchdServiceRecovery:
+    @pytest.fixture(autouse=True)
+    def _stub_launchd_domain(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr(gateway_cli, "_launchd_loaded_domain", lambda label=None: "gui/501")
+
     def test_get_restart_drain_timeout_prefers_env_then_config_then_default(self, monkeypatch):
         monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
         monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})
@@ -214,6 +255,23 @@ class TestLaunchdServiceRecovery:
             ["launchctl", "bootout", f"{domain}/{label}"],
             ["launchctl", "bootstrap", domain, str(plist_path)],
         ]
+
+    def test_launchd_install_explains_background_bootstrap_failure(self, tmp_path, monkeypatch, capsys):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "user/501")
+
+        def fake_run(cmd, check=False, **kwargs):
+            raise gateway_cli.subprocess.CalledProcessError(5, cmd, stderr="Input/output error")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_install(force=True)
+
+        out = capsys.readouterr().out
+        assert "background session" in out
+        assert "hermes gateway run" in out
+        assert plist_path.exists()
 
     def test_launchd_start_reloads_unloaded_job_and_retries(self, tmp_path, monkeypatch):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
@@ -267,6 +325,48 @@ class TestLaunchdServiceRecovery:
             ["launchctl", "bootstrap", domain, str(plist_path)],
             ["launchctl", "kickstart", target],
         ]
+
+    def test_launchd_start_exits_cleanly_with_background_guidance_when_bootstrap_fails(self, tmp_path, monkeypatch, capsys):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "user/501")
+
+        calls = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            calls.append(cmd)
+            if cmd[:2] == ["launchctl", "kickstart"]:
+                raise gateway_cli.subprocess.CalledProcessError(113, cmd, stderr="Could not find service")
+            raise gateway_cli.subprocess.CalledProcessError(5, cmd, stderr="Input/output error")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        with pytest.raises(SystemExit) as excinfo:
+            gateway_cli.launchd_start()
+
+        assert excinfo.value.code == 1
+        out = capsys.readouterr().out
+        assert "background session" in out
+        assert "hermes gateway start" in out
+
+    def test_launchd_install_explains_generic_bootstrap_failure_without_traceback(self, tmp_path, monkeypatch, capsys):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+
+        def fake_run(cmd, check=False, **kwargs):
+            raise gateway_cli.subprocess.CalledProcessError(5, cmd, stderr="Input/output error")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_install(force=True)
+
+        out = capsys.readouterr().out
+        assert "launchd failed to load the Hermes Gateway service" in out
+        assert "plutil -lint" in out
+        assert "launchctl bootstrap gui/501" in out
 
     def test_launchd_restart_drains_running_gateway_before_kickstart(self, monkeypatch):
         calls = []
