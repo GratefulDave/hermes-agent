@@ -15525,6 +15525,53 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                     logger.info("Released %d stale scoped lock(s) from old gateway.", _released)
             except Exception:
                 pass
+            # ── Post-kill lock verification ──────────────────────────
+            # The old process may still be releasing resources (ports, file
+            # handles, Telegram connections) even after the PID is gone.
+            # Before we proceed to connect platforms, verify that stale
+            # scoped locks are truly cleared. If the old gateway's locks
+            # are still present, wait with backoff and retry — this
+            # prevents the "Telegram bot token already in use" death
+            # spiral where both gateways flap against each other.
+            _verify_deadline = time.monotonic() + 30.0  # 30s total budget
+            _verify_attempt = 0
+            while time.monotonic() < _verify_deadline:
+                # Probe: try to acquire a self-scoped lock.  If the old
+                # process's locks are truly gone, acquire_scoped_lock()
+                # will clean up any stale on-disk artefacts and succeed.
+                # If it returns False the old lock is still live.
+                _locked, _existing = acquire_scoped_lock(
+                    "gateway-replace-verify",
+                    f"pid-{os.getpid()}",
+                    metadata={"role": "startup-verify"},
+                )
+                if _locked:
+                    # Verification passed — release our probe lock and
+                    # proceed to real platform connections.
+                    release_scoped_lock(
+                        "gateway-replace-verify",
+                        f"pid-{os.getpid()}",
+                    )
+                    logger.debug(
+                        "Post-replace lock verification passed (attempt %d).",
+                        _verify_attempt + 1,
+                    )
+                    break
+                _verify_attempt += 1
+                _wait = min(0.5 * (2 ** min(_verify_attempt - 1, 4)), 5.0)
+                logger.warning(
+                    "Post-replace lock verification failed (attempt %d) — "
+                    "old gateway locks may still be held. Waiting %.1fs.",
+                    _verify_attempt,
+                    _wait,
+                )
+                time.sleep(_wait)
+            else:
+                logger.error(
+                    "Post-replace lock verification timed out after %d attempts. "
+                    "Proceeding anyway — platform connections may fail.",
+                    _verify_attempt,
+                )
         else:
             hermes_home = str(get_hermes_home())
             logger.error(
