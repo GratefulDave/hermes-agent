@@ -3805,6 +3805,15 @@ class AIAgent:
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 
+    def _append_guardrail_observation(
+        self, tool_name: str, args, result: str, *, failed: bool = False,
+    ) -> str:
+        """Run the tool-call guardrail controller after a tool finishes and
+        append any warning/halt guidance to the result text."""
+        decision = self._tool_guardrails.after_call(tool_name, args, result, failed=failed)
+        self._set_tool_guardrail_halt(decision)
+        return append_toolguard_guidance(result, decision)
+
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls from the assistant message and append results to messages.
 
